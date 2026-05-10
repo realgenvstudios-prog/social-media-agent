@@ -1,20 +1,19 @@
-FROM python:3.11-slim
-
-# System deps: ffmpeg for audio extraction, curl for healthchecks
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 WORKDIR /app
+
+# Install ffmpeg for yt-dlp audio extraction
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright's Chromium + all its Linux system deps
-RUN playwright install --with-deps chromium
+# Playwright + Chromium are pre-installed in the base image — just run deps
+RUN playwright install chromium
 
-# Pre-download Whisper base model so cold starts don't hit HuggingFace
+# Pre-download Whisper base model into the image
 RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
 
 COPY . .
