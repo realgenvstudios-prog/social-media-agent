@@ -346,7 +346,8 @@ def main(slot: str) -> None:
             payload = json.loads(job["payload"])
             clip_id = payload["clip_id"]
             storage_path = payload["storage_path"]
-            caption = payload.get("caption", "")
+            clip_row = supabase.table("clips").select("caption").eq("id", clip_id).single().execute()
+            caption = (clip_row.data or {}).get("caption") or payload.get("caption", "")
 
             log.info(f"Processing job {job_id}")
             post_id = get_or_create_post_record(clip_id, slot)
