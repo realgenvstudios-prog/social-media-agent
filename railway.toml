@@ -20,5 +20,4 @@ dockerfilePath = "Dockerfile"
 # poster-fb-a     python3 poster_facebook.py a     0 */4 * * *   (every 4h)
 
 [deploy]
-startCommand = "python3 watcher.py a"
 restartPolicyType = "never"
