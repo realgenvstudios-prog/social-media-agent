@@ -264,6 +264,20 @@ def mark_post(post_id: str, status: str, error: str = None) -> None:
     }).eq("id", post_id).execute()
 
 
+def _mark_posted_with_retry(post_id: str) -> None:
+    for attempt in range(8):
+        try:
+            mark_post(post_id, "posted")
+            return
+        except Exception as e:
+            if attempt < 7:
+                wait = min(2 ** attempt * 2, 30)
+                log.warning(f"mark_post attempt {attempt+1} failed ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                log.critical(f"Upload succeeded but could not update DB after 8 attempts: {e}")
+
+
 def download_clip(storage_path: str, local_path: str) -> None:
     for attempt in range(4):
         try:
@@ -358,7 +372,7 @@ def main(slot: str) -> None:
 
                 try:
                     upload_to_tiktok(page, video_path, caption)
-                    mark_post(post_id, "posted")
+                    _mark_posted_with_retry(post_id)
                     supabase.table("jobs").update({
                         "status": "done",
                         "updated_at": datetime.now(timezone.utc).isoformat(),

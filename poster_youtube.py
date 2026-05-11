@@ -167,6 +167,23 @@ def mark_post(post_id: str, status: str, post_url: str = None, error: str = None
     }).eq("id", post_id).execute()
 
 
+def _mark_posted_with_retry(post_id: str, post_url: str) -> bool:
+    """Retry marking a post as 'posted' after a successful upload.
+    Prevents duplicate uploads when a transient network error hits the DB call."""
+    for attempt in range(8):
+        try:
+            mark_post(post_id, "posted", post_url=post_url)
+            return True
+        except Exception as e:
+            if attempt < 7:
+                wait = min(2 ** attempt * 2, 30)
+                log.warning(f"mark_post attempt {attempt+1} failed ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                log.critical(f"Uploaded to {post_url} but could not update DB after 8 attempts: {e}")
+    return False
+
+
 def download_clip(storage_path: str, local_path: str) -> None:
     for attempt in range(4):
         try:
@@ -202,13 +219,14 @@ def main(slot: str) -> None:
     for job in all_jobs:
         payload = json.loads(job["payload"])
         clip_id = payload["clip_id"]
-        already = (
-            supabase.table("posts").select("id")
+        records = (
+            supabase.table("posts").select("id, status, post_url")
             .eq("clip_id", clip_id).eq("poster_slot", slot)
-            .eq("platform", "youtube").eq("status", "posted")
+            .eq("platform", "youtube")
             .execute().data
         )
-        if not already:
+        # Skip if status=posted OR if post_url is set (upload succeeded but status update failed)
+        if not any(r.get("status") == "posted" or r.get("post_url") for r in records):
             jobs.append(job)
 
     log.info(f"{len(jobs)} clip(s) to post on YouTube.")
@@ -240,11 +258,12 @@ def main(slot: str) -> None:
 
             try:
                 url = upload_to_youtube(youtube, video_path, caption)
-                mark_post(post_id, "posted", post_url=url)
-                supabase.table("jobs").update({
-                    "status": "done",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", job_id).execute()
+                marked = _mark_posted_with_retry(post_id, url)
+                job_update = {"status": "done", "updated_at": datetime.now(timezone.utc).isoformat()}
+                if not marked:
+                    # Upload succeeded — note the URL so manual recovery is possible
+                    job_update["error"] = f"Posted at {url} — DB status update failed, verify manually"
+                supabase.table("jobs").update(job_update).eq("id", job_id).execute()
                 log.info(f"Job {job_id} done.")
             except HttpError as exc:
                 log.error(f"YouTube API error: {exc}")
