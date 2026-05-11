@@ -12,12 +12,13 @@ dockerfilePath = "Dockerfile"
 #   WHISPER_MODEL=base
 
 # ── Cron schedules ─────────────────────────────────────────────────────────
-# Service         Start command                    Cron
-# watcher-a       python3 watcher.py a             0 */6 * * *   (every 6h)
-# clipper-a       python3 clipper.py a             */30 * * * *  (every 30m)
-# poster-tiktok-a python3 poster_tiktok.py a       0 */4 * * *   (every 4h)
-# poster-yt-a     python3 poster_youtube.py a      0 */4 * * *   (every 4h)
-# poster-fb-a     python3 poster_facebook.py a     0 */4 * * *   (every 4h)
+# Service              Start command                    Cron
+# watcher-a            python3 watcher.py a             0 */6 * * *   (every 6h)
+# clipper-a            python3 clipper.py a             */30 * * * *  (every 30m)
+# poster-tiktok-a      python3 poster_tiktok.py a       0 */4 * * *   (every 4h)
+# poster-yt-a          python3 poster_youtube.py a      0 */4 * * *   (every 4h)
+# poster-fb-a          python3 poster_facebook.py a     0 */4 * * *   (every 4h)
+# manual-processor-a   python3 process_video.py a       */5 * * * *   (every 5m)
 
 [deploy]
 restartPolicyType = "never"
