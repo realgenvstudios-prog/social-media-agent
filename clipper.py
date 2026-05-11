@@ -16,6 +16,7 @@ from pathlib import Path
 import yt_dlp
 import anthropic
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
 from supabase import create_client, Client
 
 load_dotenv(override=True)
@@ -31,9 +32,20 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLIP_BUCKET = "clips"
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+_whisper: WhisperModel | None = None
+
+
+def get_whisper() -> WhisperModel:
+    global _whisper
+    if _whisper is None:
+        log.info(f"Loading Whisper '{WHISPER_MODEL}'...")
+        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    return _whisper
 
 
 # ---------------------------------------------------------------------------
@@ -237,12 +249,12 @@ def upload_clip(local_path: str, storage_path: str) -> None:
 # Per-job logic
 # ---------------------------------------------------------------------------
 
-def process_job(job: dict) -> None:
+def process_job(job: dict, already_claimed: bool = False) -> None:
     job_id = job["id"]
     client_id = job["client_id"]
     video_id = job["video_id"]
 
-    if not claim_job(job_id):
+    if not already_claimed and not claim_job(job_id):
         log.info(f"Job {job_id} already claimed, skipping.")
         return
 
@@ -304,11 +316,125 @@ def process_job(job: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Manual job pipeline (watch_manual jobs submitted via dashboard)
+# ---------------------------------------------------------------------------
+
+def _fetch_metadata(url: str) -> dict:
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return {
+        "id": info["id"], "title": info.get("title", ""), "url": url,
+        "duration": info.get("duration"), "upload_date": info.get("upload_date"),
+        "view_count": info.get("view_count"), "thumbnail": info.get("thumbnail"),
+        "description": info.get("description", ""), "like_count": info.get("like_count"),
+        "channel": info.get("channel", ""),
+    }
+
+
+def _download_audio(url: str, stem: str) -> str:
+    ydl_opts = {
+        "quiet": True, "no_warnings": True, "format": "bestaudio/best",
+        "outtmpl": stem, "retries": 10, "fragment_retries": 10,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    path = stem + ".mp3"
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Audio download failed — expected {path}")
+    return path
+
+
+def _transcribe(audio_path: str) -> list[dict]:
+    model = get_whisper()
+    segments, _ = model.transcribe(audio_path, beam_size=5)
+    return [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()} for s in segments if s.text.strip()]
+
+
+def _save_video(client_id: str, meta: dict, segments: list[dict]) -> str:
+    full_text = " ".join(s["text"] for s in segments)
+    result = supabase.table("videos").insert({
+        "client_id": client_id, "youtube_video_id": meta["id"],
+        "title": meta["title"], "url": meta["url"],
+        "duration_seconds": int(meta["duration"]) if meta.get("duration") else None,
+        "upload_date": meta.get("upload_date"), "view_count": meta.get("view_count"),
+        "thumbnail_url": meta.get("thumbnail"), "description": meta.get("description"),
+        "like_count": meta.get("like_count"), "channel_name": meta.get("channel"),
+        "transcript_segments": json.dumps(segments), "transcript_text": full_text,
+        "status": "transcribed", "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+    return result.data[0]["id"]
+
+
+def process_manual_job(job: dict) -> None:
+    job_id = job["id"]
+    client_id = job["client_id"]
+    url = json.loads(job["payload"])["url"]
+    log.info(f"Manual job {job_id}: {url}")
+
+    supabase.table("jobs").update({
+        "status": "running", "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", job_id).execute()
+
+    try:
+        # Step 1 — transcribe (skip if already done)
+        log.info("Fetching video metadata...")
+        meta = _fetch_metadata(url)
+        existing = supabase.table("videos").select("id, title, transcript_segments").eq("youtube_video_id", meta["id"]).execute()
+
+        if existing.data:
+            video_db_id = existing.data[0]["id"]
+            title = existing.data[0]["title"]
+            segments = json.loads(existing.data[0]["transcript_segments"])
+            log.info(f"Already transcribed (id={video_db_id}), skipping download.")
+        else:
+            title = meta["title"]
+            log.info(f"Downloading audio: {title}")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                audio_path = _download_audio(url, os.path.join(tmpdir, "audio"))
+                log.info(f"Audio ready ({os.path.getsize(audio_path)/1e6:.1f} MB). Transcribing...")
+                segments = _transcribe(audio_path)
+            log.info(f"Transcribed {len(segments)} segments.")
+            video_db_id = _save_video(client_id, meta, segments)
+            log.info(f"Video saved (id={video_db_id}).")
+
+        # Step 2 — skip clipping if clips already exist
+        if supabase.table("clips").select("id").eq("video_id", video_db_id).execute().data:
+            log.info("Clips already exist — skipping clipping.")
+            supabase.table("jobs").update({"status": "done", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", job_id).execute()
+            return
+
+        # Step 3 — clip (reuse existing clipper logic)
+        fake_job = {"id": job_id, "client_id": client_id, "video_id": video_db_id}
+        supabase.table("jobs").update({"video_id": video_db_id}).eq("id", job_id).execute()
+        process_job(fake_job, already_claimed=True)
+
+    except Exception as exc:
+        log.error(f"Manual job {job_id} failed: {exc}", exc_info=True)
+        fail_job(job_id, str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     log.info(f"Clipper starting — {datetime.now(timezone.utc).isoformat()}")
+
+    # Handle any dashboard-submitted manual video requests first
+    manual_jobs = (
+        supabase.table("jobs").select("*")
+        .eq("job_type", "watch_manual").eq("status", "pending")
+        .order("created_at").execute().data
+    )
+    if manual_jobs:
+        log.info(f"{len(manual_jobs)} manual job(s) to process.")
+        for job in manual_jobs:
+            try:
+                process_manual_job(job)
+            except Exception:
+                pass
+
     jobs = get_pending_clip_jobs()
     log.info(f"{len(jobs)} pending clip job(s).")
 
