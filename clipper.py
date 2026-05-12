@@ -133,31 +133,63 @@ def enqueue_poster_jobs(client_id: str, video_id: str, clip_id: str, storage_pat
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are a viral short-form content expert specialising in YouTube-to-TikTok repurposing.
-Given a transcript with timestamps, identify the 3 best moments to clip for TikTok, YouTube Shorts, and Instagram Reels.
+You are a viral short-form content strategist for an African podcast.
+Your job is to find moments that make viewers stop scrolling, watch to the end, rewatch, save, and share on TikTok, YouTube Shorts, and Facebook Reels.
 
-Selection criteria (in order of priority):
-1. Self-contained — the moment makes sense without context
-2. Strong hook in the first 5 seconds — surprising stat, bold claim, or relatable pain point
-3. 45–90 seconds long — long enough to deliver value, short enough to retain viewers
-4. High rewatch potential — insight, emotion, or humour
+AUDIENCE: Ambitious Africans aged 18–35, primarily West African. They are frustrated with barriers to wealth, proud of their identity, hungry for real talk about money and success, and respond strongly to content that validates their experience or challenges them to think differently.
 
-Return ONLY a valid JSON array with exactly 3 objects, no extra text:
+WHAT STOPS A SCROLL (priority order):
+1. Open loop — an incomplete thought or bold claim in the first 3 seconds that the viewer must stay to resolve
+2. Pattern interrupt — an unexpected emotion, revelation, or stat that breaks autopilot scrolling
+3. Identity resonance — "this is about me / my people / my reality"
+4. Forbidden knowledge — a truth that feels like it is not supposed to be public
+5. Social currency — something worth sharing because sharing it makes you look informed or culturally aware
+
+MOMENTS THAT GO VIRAL IN THIS NICHE:
+- Contrarian takes that directly contradict popular belief about money, Africa, or success
+- Specific numbers: "I made X in Y months" or "X% of Africans..." — concrete data hits harder than vague claims
+- Validation moments: articulating a frustration the viewer has always felt but never heard said this clearly
+- Life-changing turning points: the exact moment a guest's mindset or trajectory shifted and why
+- Uncomfortable truths the audience will recognise about themselves
+- African identity moments: content that makes the audience feel proud, seen, or respectfully called out as a community
+- Disagreement or pushback between host and guest — tension keeps viewers watching
+
+CLIP STRUCTURE FOR MAXIMUM RETENTION:
+- 0–3s  HOOK:    Open loop or emotional spike. Ideally starts mid-claim, mid-story, or with a bold statement
+- 3–35s BUILD:   Raise the stakes, add context, increase tension
+- 35–55s PEAK:   The most powerful, surprising, or emotional moment in the clip
+- 55–75s LANDING: One memorable closing line — something quotable that people will repeat
+
+EMOTIONS THAT DRIVE SHARES AND SAVES:
+Awe ("I didn't know that was possible"), Validation ("finally someone said it"),
+Aspiration ("I could do this"), Curiosity ("wait — say more"), Cultural identity ("this is so us"),
+Constructive outrage ("this is wrong and we need to talk about it")
+
+WHAT TO AVOID:
+- Clips that only make sense if the viewer has watched the full episode
+- Sections that are pure background or setup with no emotional tension
+- Slow starts — if the first sentence is not compelling, the clip is wrong
+- Vague motivational language without a specific story or stat behind it
+
+CAPTION RULES:
+- First line must work as a standalone hook — viewers see it before the video plays on some platforms
+- Trigger exactly ONE primary emotion per caption
+- End with a question or soft CTA ("save this", "share with someone who needs to hear this", "what do you think?")
+- Mix hashtags: 2 high-volume (#Africa #Wealth #Podcast) + 2–3 niche (#KonnectedMinds #AfricanEntrepreneur #GhanaTwitter)
+- Keep the caption line under 150 characters; hashtags go on a separate line
+
+Return ONLY a valid JSON array with exactly 10 objects, no extra text:
 [
   {
     "start": 123.4,
     "end": 187.2,
-    "hook": "one sentence explaining what makes this clip hook viewers instantly",
-    "caption": "engaging caption under 150 chars with 3–5 relevant hashtags"
+    "hook": "one sentence explaining what makes this clip stop a scroll",
+    "caption": "first-line hook under 150 chars\\n\\n#KonnectedMinds #Africa #Wealth"
   }
 ]"""
 
 
 def ask_claude_for_moments(transcript_segments: list[dict], video_title: str) -> list[dict]:
-    # Cap at 1000 segments to keep payload under ~8k tokens
-    transcript_segments = transcript_segments[:1000]
-
-    # Build a compact transcript string: [MM:SS] text
     lines = []
     for seg in transcript_segments:
         minutes = int(seg["start"] // 60)
@@ -165,11 +197,11 @@ def ask_claude_for_moments(transcript_segments: list[dict], video_title: str) ->
         lines.append(f"[{minutes:02d}:{seconds:02d}] {seg['text']}")
     transcript_text = "\n".join(lines)
 
-    log.info(f"Sending {len(transcript_segments)} segments (~{len(transcript_text.split())} words) to Claude Haiku...")
+    log.info(f"Sending {len(transcript_segments)} segments (~{len(transcript_text.split())} words) to Claude Sonnet...")
 
     message = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
         system=SYSTEM_PROMPT,
         messages=[{
             "role": "user",
@@ -180,21 +212,67 @@ def ask_claude_for_moments(transcript_segments: list[dict], video_title: str) ->
     raw = message.content[0].text.strip()
     log.info(f"Claude responded. Input tokens: {message.usage.input_tokens}, Output tokens: {message.usage.output_tokens}")
 
-    # Strip markdown code fences if Claude wraps in them
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
 
     moments = json.loads(raw)
-    if not isinstance(moments, list) or len(moments) != 3:
-        raise ValueError(f"Expected 3 moments from Claude, got: {raw}")
+    if not isinstance(moments, list) or len(moments) < 5:
+        raise ValueError(f"Expected 10 moments from Claude, got {len(moments) if isinstance(moments, list) else 0}: {raw[:200]}")
     return moments
 
 
 # ---------------------------------------------------------------------------
 # Video download + clip cutting
 # ---------------------------------------------------------------------------
+
+def _format_ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def _extract_words_for_clip(segments: list[dict], clip_start: float, clip_end: float) -> list[dict]:
+    """Return word-level timestamps within the clip, offset to clip-relative time."""
+    words = []
+    for seg in segments:
+        for w in seg.get("words", []):
+            if w["start"] >= clip_start - 0.1 and w["end"] <= clip_end + 0.1:
+                words.append({
+                    "start": round(w["start"] - clip_start, 2),
+                    "end": round(w["end"] - clip_start, 2),
+                    "word": w["word"],
+                })
+    return words
+
+
+def _write_ass_subtitles(words: list[dict], output_path: str) -> None:
+    """Generate a TikTok-style word-by-word ASS subtitle file (3 words per chunk)."""
+    header = (
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,54,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "1,0,0,0,100,100,1,0,1,3,1,2,10,10,55,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    lines = [header]
+    chunk_size = 3
+    for i in range(0, len(words), chunk_size):
+        chunk = words[i : i + chunk_size]
+        start = _format_ass_time(chunk[0]["start"])
+        end = _format_ass_time(chunk[-1]["end"])
+        text = "  ".join(w["word"].upper() for w in chunk)
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
 
 def download_video_section(video_url: str, start: float, end: float, output_path: str) -> None:
     """Download only the needed section of the video using yt-dlp."""
@@ -213,19 +291,27 @@ def download_video_section(video_url: str, start: float, end: float, output_path
         ydl.download([video_url])
 
 
-def cut_clip(input_path: str, start: float, end: float, output_path: str) -> None:
-    """Re-encode a precise clip from an already-downloaded video section."""
+def cut_clip(input_path: str, start: float, end: float, output_path: str, words: list[dict] | None = None) -> None:
+    """Re-encode a clip and optionally burn word-by-word subtitles."""
     duration = end - start
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-t", str(duration),
+
+    ass_path = output_path.replace(".mp4", ".ass")
+    use_subs = bool(words)
+    if use_subs:
+        _write_ass_subtitles(words, ass_path)
+
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-t", str(duration)]
+    if use_subs:
+        cmd += ["-vf", f"ass={ass_path}"]
+    cmd += [
         "-c:v", "libx264", "-crf", "23", "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
+    if use_subs and os.path.exists(ass_path):
+        os.remove(ass_path)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg failed: {result.stderr[-500:]}")
 
@@ -289,11 +375,12 @@ def process_job(job: dict, already_claimed: bool = False) -> None:
                     raise FileNotFoundError(f"No downloaded file found for clip {i}")
                 section_path = str(candidates[0])
 
-                # 3. Re-encode for clean cut
+                # 3. Re-encode for clean cut with word-by-word subtitles
                 clip_filename = f"clip_{i}.mp4"
                 clip_path = os.path.join(tmpdir, clip_filename)
-                log.info(f"Clip {i}: Cutting with FFmpeg...")
-                cut_clip(section_path, 0, duration, clip_path)
+                log.info(f"Clip {i}: Cutting with FFmpeg + subtitles...")
+                clip_words = _extract_words_for_clip(segments, start, end)
+                cut_clip(section_path, 0, duration, clip_path, words=clip_words or None)
 
                 # 4. Upload to Supabase Storage
                 storage_path = f"{client_id}/{video_id}/clip_{i}.mp4"
@@ -313,6 +400,125 @@ def process_job(job: dict, already_claimed: bool = False) -> None:
         log.error(f"Clip job {job_id} failed: {exc}", exc_info=True)
         fail_job(job_id, str(exc))
         raise
+
+
+# ---------------------------------------------------------------------------
+# Top-up: find more viral moments when the posting queue runs low
+# ---------------------------------------------------------------------------
+
+def _ask_claude_for_more_moments(segments: list[dict], title: str, existing_ranges: list[tuple]) -> list[dict]:
+    """Ask Claude for additional moments, explicitly excluding already-clipped ranges."""
+    lines = []
+    for seg in segments:
+        minutes = int(seg["start"] // 60)
+        seconds = int(seg["start"] % 60)
+        lines.append(f"[{minutes:02d}:{seconds:02d}] {seg['text']}")
+    transcript_text = "\n".join(lines)
+
+    excluded = "\n".join(f"- {s:.0f}s to {e:.0f}s" for s, e in existing_ranges)
+    user_content = (
+        f"Video title: {title}\n\n"
+        f"Already clipped sections — DO NOT overlap with these:\n{excluded}\n\n"
+        f"Find 3–5 additional viral moments from different parts of the video.\n\n"
+        f"Transcript:\n{transcript_text}"
+    )
+
+    message = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    moments = json.loads(raw)
+    return moments if isinstance(moments, list) else []
+
+
+def run_topup(slot: str) -> None:
+    """Top up the clip queue when it drops below 6 unposted clips."""
+    pending_count = len(
+        supabase.table("jobs").select("id")
+        .eq("job_type", f"post_{slot}").eq("status", "pending")
+        .execute().data
+    )
+    if pending_count >= 6:
+        return
+
+    log.info(f"Queue has {pending_count} pending post jobs — running top-up.")
+
+    videos = supabase.table("videos").select("id, title, url, transcript_segments, client_id").execute().data
+    if not videos:
+        log.info("No videos available for top-up.")
+        return
+
+    for video in videos:
+        video_id = video["id"]
+        existing_clips = (
+            supabase.table("clips").select("start_seconds, end_seconds, client_id")
+            .eq("video_id", video_id).execute().data
+        )
+        if len(existing_clips) >= 20:
+            continue
+
+        existing_ranges = [(c["start_seconds"], c["end_seconds"]) for c in existing_clips]
+        client_id = (existing_clips[0]["client_id"] if existing_clips else video.get("client_id"))
+        if not client_id:
+            continue
+
+        segments = json.loads(video["transcript_segments"])
+        log.info(f"Top-up: finding more moments from '{video['title']}'...")
+
+        try:
+            new_moments = _ask_claude_for_more_moments(segments, video["title"], existing_ranges)
+        except Exception as e:
+            log.warning(f"Top-up Claude call failed: {e}")
+            continue
+
+        if not new_moments:
+            continue
+
+        url = video["url"]
+        start_index = len(existing_clips) + 1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, moment in enumerate(new_moments, start=start_index):
+                start = float(moment["start"])
+                end = float(moment["end"])
+                duration = round(end - start, 1)
+                log.info(f"Top-up clip {i}: {start:.1f}s → {end:.1f}s")
+                try:
+                    section_stem = os.path.join(tmpdir, f"topup_{i}")
+                    section_path = download_video_section(url, start, end, section_stem)
+                    candidates = list(Path(tmpdir).glob(f"topup_{i}*"))
+                    if not candidates:
+                        raise FileNotFoundError(f"No file for top-up clip {i}")
+                    section_path = str(candidates[0])
+
+                    clip_path = os.path.join(tmpdir, f"topup_clip_{i}.mp4")
+                    clip_words = _extract_words_for_clip(segments, start, end)
+                    cut_clip(section_path, 0, duration, clip_path, words=clip_words or None)
+
+                    storage_path = f"{client_id}/{video_id}/clip_{i}.mp4"
+                    upload_clip(clip_path, storage_path)
+
+                    clip_id = save_clip(client_id, video_id, i, moment, storage_path)
+                    enqueue_poster_jobs(client_id, video_id, clip_id, storage_path, moment.get("caption", ""))
+                    log.info(f"Top-up clip {i} done.")
+                except Exception as e:
+                    log.error(f"Top-up clip {i} failed: {e}", exc_info=True)
+
+        new_pending = len(
+            supabase.table("jobs").select("id")
+            .eq("job_type", f"post_{slot}").eq("status", "pending")
+            .execute().data
+        )
+        if new_pending >= 6:
+            log.info(f"Queue now at {new_pending} — top-up complete.")
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +553,17 @@ def _download_audio(url: str, stem: str) -> str:
 
 def _transcribe(audio_path: str) -> list[dict]:
     model = get_whisper()
-    segments, _ = model.transcribe(audio_path, beam_size=5)
-    return [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()} for s in segments if s.text.strip()]
+    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+    result = []
+    for seg in segments:
+        if not seg.text.strip():
+            continue
+        words = [
+            {"start": round(w.start, 2), "end": round(w.end, 2), "word": w.word.strip()}
+            for w in (seg.words or []) if w.word.strip()
+        ]
+        result.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip(), "words": words})
+    return result
 
 
 def _save_video(client_id: str, meta: dict, segments: list[dict]) -> str:
@@ -418,10 +633,10 @@ def process_manual_job(job: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(slot: str = "a") -> None:
     log.info(f"Clipper starting — {datetime.now(timezone.utc).isoformat()}")
 
-    # Handle any dashboard-submitted manual video requests first
+    # 1. Handle dashboard-submitted manual video requests first
     manual_jobs = (
         supabase.table("jobs").select("*")
         .eq("job_type", "watch_manual").eq("status", "pending")
@@ -435,6 +650,7 @@ def main() -> None:
             except Exception:
                 pass
 
+    # 2. Process regular clip jobs
     jobs = get_pending_clip_jobs()
     log.info(f"{len(jobs)} pending clip job(s).")
 
@@ -444,8 +660,16 @@ def main() -> None:
         except Exception:
             pass  # already logged and marked failed, continue to next job
 
+    # 3. Top up the posting queue if it's running low
+    try:
+        run_topup(slot)
+    except Exception as e:
+        log.error(f"Top-up failed: {e}", exc_info=True)
+
     log.info("Clipper run complete.")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    slot = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("a", "b") else "a"
+    main(slot)

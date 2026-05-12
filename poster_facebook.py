@@ -327,7 +327,8 @@ def main(slot: str) -> None:
         if not already:
             jobs.append(job)
 
-    log.info(f"{len(jobs)} clip(s) to post on Facebook.")
+    jobs = jobs[:3]
+    log.info(f"{len(jobs)} clip(s) to post on Facebook (max 3 per run).")
     if not jobs:
         return
 

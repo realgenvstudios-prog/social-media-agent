@@ -229,7 +229,8 @@ def main(slot: str) -> None:
         if not any(r.get("status") == "posted" or r.get("post_url") for r in records):
             jobs.append(job)
 
-    log.info(f"{len(jobs)} clip(s) to post on YouTube.")
+    jobs = jobs[:3]
+    log.info(f"{len(jobs)} clip(s) to post on YouTube (max 3 per run).")
     if not jobs:
         return
 

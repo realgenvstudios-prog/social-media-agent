@@ -186,16 +186,23 @@ def download_audio(video_url: str, output_stem: str) -> str:
 
 def transcribe(audio_path: str) -> list[dict]:
     model = get_whisper_model()
-    segments, _ = model.transcribe(audio_path, beam_size=5)
-    return [
-        {
+    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+    result = []
+    for seg in segments:
+        if not seg.text.strip():
+            continue
+        words = [
+            {"start": round(w.start, 2), "end": round(w.end, 2), "word": w.word.strip()}
+            for w in (seg.words or [])
+            if w.word.strip()
+        ]
+        result.append({
             "start": round(seg.start, 2),
             "end": round(seg.end, 2),
             "text": seg.text.strip(),
-        }
-        for seg in segments
-        if seg.text.strip()
-    ]
+            "words": words,
+        })
+    return result
 
 
 # ---------------------------------------------------------------------------
