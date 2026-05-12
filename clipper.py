@@ -296,7 +296,7 @@ def _write_ass_subtitles(words: list[dict], output_path: str) -> None:
 def download_video_section(video_url: str, start: float, end: float, output_path: str) -> None:
     """Download only the needed section of the video using yt-dlp."""
     ydl_opts = _ydl_opts({
-        "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
+        "format": "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best[height<=720]/best",
         "merge_output_format": "mp4",
         "outtmpl": output_path,
         "retries": 10,
