@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Always upgrade yt-dlp to latest — YouTube breaks older versions frequently
+RUN pip install --no-cache-dir --upgrade yt-dlp
 
 # Playwright + Chromium are pre-installed in the base image — just run deps
 RUN playwright install chromium

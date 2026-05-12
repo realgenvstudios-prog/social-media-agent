@@ -8,6 +8,7 @@ then enqueues a clipper job.
 import os
 import json
 import tempfile
+import time
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -32,7 +33,34 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 # "base" peak RAM with int8 ≈ 150MB — fits in Railway 512MB
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 
+SESSION_BUCKET = "sessions"
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+_cookie_file: str | None = None
+
+
+def get_cookie_file() -> str | None:
+    global _cookie_file
+    if _cookie_file is not None:
+        return _cookie_file
+    try:
+        data = supabase.storage.from_(SESSION_BUCKET).download("sessions/youtube_cookies.txt")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        tmp.write(data)
+        tmp.close()
+        _cookie_file = tmp.name
+        log.info("YouTube cookies loaded.")
+    except Exception:
+        _cookie_file = ""
+    return _cookie_file or None
+
+
+def _ydl_opts(extra: dict = {}) -> dict:
+    opts = {"quiet": True, "no_warnings": True, **({"cookiefile": get_cookie_file()} if get_cookie_file() else {})}
+    opts.update(extra)
+    return opts
+
 
 # Load Whisper once per process — not once per video
 _whisper_model: WhisperModel | None = None
@@ -104,13 +132,7 @@ def enqueue_clip_job(client_id: str, video_db_id: str) -> None:
 
 def fetch_recent_videos(channel_url: str, limit: int = 5) -> list[dict]:
     """Return metadata for the N most recent videos without downloading."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "playlistend": limit,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(_ydl_opts({"extract_flat": True, "playlistend": limit})) as ydl:
         info = ydl.extract_info(channel_url, download=False)
 
     entries = info.get("entries") or []
@@ -132,11 +154,7 @@ def fetch_recent_videos(channel_url: str, limit: int = 5) -> list[dict]:
 
 def fetch_full_metadata(video_url: str) -> dict:
     """Fetch complete metadata for a single video (no download)."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
         info = ydl.extract_info(video_url, download=False)
     return {
         "id": info["id"],
@@ -158,9 +176,7 @@ def download_audio(video_url: str, output_stem: str) -> str:
     The clipper agent will re-download video segments it needs separately.
     Returns the path to the mp3 file.
     """
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+    with yt_dlp.YoutubeDL(_ydl_opts({
         "format": "bestaudio/best",
         "outtmpl": output_stem,
         "retries": 10,
@@ -170,8 +186,7 @@ def download_audio(video_url: str, output_stem: str) -> str:
             "preferredcodec": "mp3",
             "preferredquality": "128",
         }],
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    })) as ydl:
         ydl.download([video_url])
 
     mp3_path = output_stem + ".mp3"

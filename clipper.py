@@ -32,12 +32,31 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLIP_BUCKET = "clips"
+SESSION_BUCKET = "sessions"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 _whisper: WhisperModel | None = None
+_cookie_file: str | None = None
+
+
+def get_cookie_file() -> str | None:
+    """Download youtube_cookies.txt from Supabase Storage once per process."""
+    global _cookie_file
+    if _cookie_file is not None:
+        return _cookie_file
+    try:
+        data = supabase.storage.from_(SESSION_BUCKET).download("sessions/youtube_cookies.txt")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        tmp.write(data)
+        tmp.close()
+        _cookie_file = tmp.name
+        log.info("YouTube cookies loaded.")
+    except Exception:
+        _cookie_file = ""  # empty string = no cookies, don't retry
+    return _cookie_file or None
 
 
 def get_whisper() -> WhisperModel:
@@ -276,9 +295,7 @@ def _write_ass_subtitles(words: list[dict], output_path: str) -> None:
 
 def download_video_section(video_url: str, start: float, end: float, output_path: str) -> None:
     """Download only the needed section of the video using yt-dlp."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+    ydl_opts = _ydl_opts({
         "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
         "merge_output_format": "mp4",
         "outtmpl": output_path,
@@ -286,7 +303,7 @@ def download_video_section(video_url: str, start: float, end: float, output_path
         "fragment_retries": 10,
         "download_ranges": yt_dlp.utils.download_range_func(None, [(start, end)]),
         "force_keyframes_at_cuts": True,
-    }
+    })
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
 
@@ -525,8 +542,14 @@ def run_topup(slot: str) -> None:
 # Manual job pipeline (watch_manual jobs submitted via dashboard)
 # ---------------------------------------------------------------------------
 
+def _ydl_opts(extra: dict = {}) -> dict:
+    opts = {"quiet": True, "no_warnings": True, **({"cookiefile": get_cookie_file()} if get_cookie_file() else {})}
+    opts.update(extra)
+    return opts
+
+
 def _fetch_metadata(url: str) -> dict:
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
     return {
         "id": info["id"], "title": info.get("title", ""), "url": url,
@@ -538,11 +561,10 @@ def _fetch_metadata(url: str) -> dict:
 
 
 def _download_audio(url: str, stem: str) -> str:
-    ydl_opts = {
-        "quiet": True, "no_warnings": True, "format": "bestaudio/best",
-        "outtmpl": stem, "retries": 10, "fragment_retries": 10,
+    ydl_opts = _ydl_opts({
+        "format": "bestaudio/best", "outtmpl": stem, "retries": 10, "fragment_retries": 10,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
-    }
+    })
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     path = stem + ".mp3"
