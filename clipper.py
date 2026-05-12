@@ -543,7 +543,13 @@ def run_topup(slot: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _ydl_opts(extra: dict = {}) -> dict:
-    opts = {"quiet": True, "no_warnings": True, **({"cookiefile": get_cookie_file()} if get_cookie_file() else {})}
+    cookie = get_cookie_file()
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        **({"cookiefile": cookie} if cookie else {}),
+    }
     opts.update(extra)
     return opts
 
