@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir --upgrade yt-dlp
 RUN playwright install chromium
 
 # Pre-download Whisper base model into the image
-RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
+RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
 
 COPY . .
 

@@ -33,7 +33,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLIP_BUCKET = "clips"
 SESSION_BUCKET = "sessions"
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "tiny")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -573,19 +573,56 @@ def _download_audio(url: str, stem: str) -> str:
     return path
 
 
-def _transcribe(audio_path: str) -> list[dict]:
-    model = get_whisper()
+def _transcribe_chunk(model: WhisperModel, audio_path: str, offset: float = 0.0) -> list[dict]:
     segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
     result = []
     for seg in segments:
         if not seg.text.strip():
             continue
         words = [
-            {"start": round(w.start, 2), "end": round(w.end, 2), "word": w.word.strip()}
+            {"start": round(w.start + offset, 2), "end": round(w.end + offset, 2), "word": w.word.strip()}
             for w in (seg.words or []) if w.word.strip()
         ]
-        result.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip(), "words": words})
+        result.append({"start": round(seg.start + offset, 2), "end": round(seg.end + offset, 2),
+                        "text": seg.text.strip(), "words": words})
     return result
+
+
+def _transcribe(audio_path: str) -> list[dict]:
+    model = get_whisper()
+    CHUNK = 600  # 10 minutes in seconds
+
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True, text=True,
+    )
+    try:
+        duration = float(r.stdout.strip())
+    except ValueError:
+        duration = 0.0
+
+    if duration <= CHUNK * 1.2:
+        return _transcribe_chunk(model, audio_path)
+
+    log.info(f"Long audio ({duration/60:.1f} min) — transcribing in 10-min chunks.")
+    all_segments: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        chunk_start = 0.0
+        idx = 0
+        while chunk_start < duration:
+            chunk_path = os.path.join(tmpdir, f"chunk_{idx}.mp3")
+            subprocess.run([
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ss", str(chunk_start), "-t", str(CHUNK),
+                "-c", "copy", chunk_path,
+            ], capture_output=True)
+            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1000:
+                log.info(f"Transcribing chunk {idx} (offset {chunk_start/60:.1f} min)...")
+                all_segments.extend(_transcribe_chunk(model, chunk_path, offset=chunk_start))
+            chunk_start += CHUNK
+            idx += 1
+    return all_segments
 
 
 def _save_video(client_id: str, meta: dict, segments: list[dict]) -> str:

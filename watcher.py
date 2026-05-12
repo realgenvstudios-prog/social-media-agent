@@ -31,7 +31,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 # "tiny" for Railway free tier with very tight RAM; "base" for better accuracy
 # "base" peak RAM with int8 ≈ 150MB — fits in Railway 512MB
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "tiny")
 
 SESSION_BUCKET = "sessions"
 
@@ -199,25 +199,56 @@ def download_audio(video_url: str, output_stem: str) -> str:
 # Whisper transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(audio_path: str) -> list[dict]:
-    model = get_whisper_model()
+def _transcribe_chunk(model: WhisperModel, audio_path: str, offset: float = 0.0) -> list[dict]:
     segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
     result = []
     for seg in segments:
         if not seg.text.strip():
             continue
         words = [
-            {"start": round(w.start, 2), "end": round(w.end, 2), "word": w.word.strip()}
-            for w in (seg.words or [])
-            if w.word.strip()
+            {"start": round(w.start + offset, 2), "end": round(w.end + offset, 2), "word": w.word.strip()}
+            for w in (seg.words or []) if w.word.strip()
         ]
-        result.append({
-            "start": round(seg.start, 2),
-            "end": round(seg.end, 2),
-            "text": seg.text.strip(),
-            "words": words,
-        })
+        result.append({"start": round(seg.start + offset, 2), "end": round(seg.end + offset, 2),
+                        "text": seg.text.strip(), "words": words})
     return result
+
+
+def transcribe(audio_path: str) -> list[dict]:
+    model = get_whisper_model()
+    CHUNK = 600  # 10 minutes
+
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True, text=True,
+    )
+    try:
+        duration = float(r.stdout.strip())
+    except ValueError:
+        duration = 0.0
+
+    if duration <= CHUNK * 1.2:
+        return _transcribe_chunk(model, audio_path)
+
+    log.info(f"Long audio ({duration/60:.1f} min) — transcribing in 10-min chunks.")
+    all_segments: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        chunk_start = 0.0
+        idx = 0
+        while chunk_start < duration:
+            chunk_path = os.path.join(tmpdir, f"chunk_{idx}.mp3")
+            subprocess.run([
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ss", str(chunk_start), "-t", str(CHUNK),
+                "-c", "copy", chunk_path,
+            ], capture_output=True)
+            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1000:
+                log.info(f"Transcribing chunk {idx} (offset {chunk_start/60:.1f} min)...")
+                all_segments.extend(_transcribe_chunk(model, chunk_path, offset=chunk_start))
+            chunk_start += CHUNK
+            idx += 1
+    return all_segments
 
 
 # ---------------------------------------------------------------------------
