@@ -1,11 +1,17 @@
 """
-Poster Agent — run as:
-  python3 poster.py a
-  python3 poster.py b
+Unified Poster — TikTok, YouTube, Facebook, Instagram
+Claude Haiku vision controls the browser like a human.
+Auto-login using credentials from env vars — no manual auth needed.
 
-Claude Haiku handles only the tricky visual questions (where's the caption box,
-where's the post button). Playwright handles everything else with proper waits.
-~3 Claude calls per platform = cheap and reliable.
+Cron: */30 * * * *  (runs every 30 min, posts only at scheduled times)
+Posting times (UTC): 09:00, 16:30, 18:00
+
+Env vars per slot:
+  POSTER_A_TIKTOK_EMAIL / POSTER_A_TIKTOK_PASSWORD
+  POSTER_A_YOUTUBE_EMAIL / POSTER_A_YOUTUBE_PASSWORD
+  POSTER_A_FACEBOOK_EMAIL / POSTER_A_FACEBOOK_PASSWORD
+  POSTER_A_INSTAGRAM_EMAIL / POSTER_A_INSTAGRAM_PASSWORD
+  (same for B: POSTER_B_...)
 """
 
 import os
@@ -15,6 +21,7 @@ import time
 import base64
 import random
 import tempfile
+import platform as sys_platform
 import logging
 from datetime import datetime, timezone
 
@@ -34,28 +41,41 @@ log = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLIP_BUCKET = "clips"
 SESSION_BUCKET = "sessions"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-PLATFORMS = ["tiktok", "youtube", "facebook"]
+PLATFORMS = ["tiktok", "youtube", "facebook", "instagram"]
+
+# Post at 09:00, 16:30, 18:00 UTC — window of ±20 minutes
+POSTING_TIMES_UTC = [(9, 0), (16, 30), (18, 0)]
+WINDOW_MINUTES = 20
 
 
 # ---------------------------------------------------------------------------
-# Targeted Claude vision — Haiku, ~3 calls per platform (cheap)
+# Time gate
 # ---------------------------------------------------------------------------
 
-def ask(page: Page, question: str, extra_context: str = "") -> dict:
-    """
-    Ask Claude Haiku one specific visual question about the current page.
-    Returns: { "found": bool, "x": int, "y": int, "answer": str }
-    """
+def is_posting_time() -> bool:
+    now = datetime.now(timezone.utc)
+    for hour, minute in POSTING_TIMES_UTC:
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        diff = abs((now - target).total_seconds() / 60)
+        if diff <= WINDOW_MINUTES:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Claude Haiku vision helpers
+# ---------------------------------------------------------------------------
+
+def ask(page: Page, question: str, context: str = "") -> dict:
     img = base64.standard_b64encode(page.screenshot()).decode()
     prompt = f"""You are controlling a browser at 1280x800 resolution.
-{extra_context}
+{context}
 
 Question: {question}
 
@@ -66,43 +86,41 @@ Reply ONLY with JSON (no markdown):
   "y": pixel y coordinate (center of element, 0 if not found),
   "answer": "brief description of what you see"
 }}"""
-
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=150,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}},
+            {"type": "text", "text": prompt},
+        ]}],
     )
-    raw = resp.content[0].text.strip().strip("```").strip()
-    if raw.startswith("json"):
-        raw = raw[4:].strip()
+    raw = resp.content[0].text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
     result = json.loads(raw)
-    log.info(f"[claude] {question[:60]}… → {result['answer']}")
+    log.info(f"[claude] {question[:70]}… → {result['answer']}")
     return result
 
 
 def click_at(page: Page, x: int, y: int, label: str = "") -> None:
-    log.info(f"Clicking {label} at ({x}, {y})")
+    log.info(f"Clicking {label} at ({x},{y})")
     page.mouse.click(x, y)
     time.sleep(1.5)
 
 
+def type_into(page: Page, x: int, y: int, text: str, label: str = "") -> None:
+    click_at(page, x, y, label)
+    page.keyboard.press("Control+a")
+    time.sleep(0.2)
+    page.keyboard.type(text, delay=60)
+    time.sleep(0.5)
+
+
 def wait_for_upload(page: Page, platform: str, timeout: int = 180) -> None:
-    """Poll until Claude confirms the upload progress bar is gone / editor is ready."""
-    log.info(f"[{platform}] Waiting for upload to finish (up to {timeout}s)...")
+    log.info(f"[{platform}] Waiting for upload (up to {timeout}s)...")
     start = time.time()
     while time.time() - start < timeout:
-        result = ask(
-            page,
-            "Is there still an upload progress bar or 'uploading' spinner visible?",
-            f"I just uploaded a video to {platform}.",
-        )
-        if not result["found"]:
+        r = ask(page, "Is there still an upload progress bar or 'uploading' spinner visible?",
+                f"I just uploaded a video to {platform}.")
+        if not r["found"]:
             log.info(f"[{platform}] Upload complete.")
             return
         time.sleep(8)
@@ -110,179 +128,330 @@ def wait_for_upload(page: Page, platform: str, timeout: int = 180) -> None:
 
 
 # ---------------------------------------------------------------------------
-# TikTok
+# Login helpers
 # ---------------------------------------------------------------------------
 
-def post_tiktok(context: BrowserContext, slot: str, video_path: str, caption: str) -> str:
+def is_logged_in(page: Page, platform: str) -> bool:
+    r = ask(page,
+            f"Are you logged into {platform}? Answer found=true if you see a home feed, profile, "
+            f"dashboard or content. Answer found=false if you see a login/sign-in/create account page.")
+    return bool(r["found"])
+
+
+def login_tiktok(page: Page, email: str, password: str) -> bool:
+    log.info("[login/tiktok] Attempting login...")
+    page.goto("https://www.tiktok.com/login/phone-or-email/email", wait_until="domcontentloaded")
+    time.sleep(3)
+    r = ask(page, "Where is the email or username input field on the login form?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], email, "email field")
+    r = ask(page, "Where is the password input field?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], password, "password field")
+    r = ask(page, "Where is the Log in or Sign in button?")
+    if not r["found"]:
+        return False
+    click_at(page, r["x"], r["y"], "login button")
+    time.sleep(5)
+    return is_logged_in(page, "TikTok")
+
+
+def login_google(page: Page, email: str, password: str) -> bool:
+    log.info("[login/youtube] Attempting Google login...")
+    page.goto("https://accounts.google.com/signin/v2/identifier", wait_until="domcontentloaded")
+    time.sleep(3)
+    r = ask(page, "Where is the email or phone input field?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], email, "email field")
+    r = ask(page, "Where is the Next button?")
+    if r["found"]:
+        click_at(page, r["x"], r["y"], "Next")
+    time.sleep(3)
+    r = ask(page, "Where is the password input field?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], password, "password field")
+    r = ask(page, "Where is the Next button?")
+    if r["found"]:
+        click_at(page, r["x"], r["y"], "Next")
+    time.sleep(5)
+    page.goto("https://studio.youtube.com", wait_until="domcontentloaded")
+    time.sleep(3)
+    return is_logged_in(page, "YouTube Studio")
+
+
+def login_facebook(page: Page, email: str, password: str) -> bool:
+    log.info("[login/facebook] Attempting login...")
+    page.goto("https://www.facebook.com", wait_until="domcontentloaded")
+    time.sleep(3)
+    r = ask(page, "Where is the email or phone number input field on the login form?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], email, "email field")
+    r = ask(page, "Where is the password input field?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], password, "password field")
+    r = ask(page, "Where is the Log In button?")
+    if not r["found"]:
+        return False
+    click_at(page, r["x"], r["y"], "Log In button")
+    time.sleep(5)
+    return is_logged_in(page, "Facebook")
+
+
+def login_instagram(page: Page, email: str, password: str) -> bool:
+    log.info("[login/instagram] Attempting login...")
+    page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded")
+    time.sleep(3)
+    r = ask(page, "Where is the username or email input field on the login form?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], email, "username field")
+    r = ask(page, "Where is the password input field?")
+    if not r["found"]:
+        return False
+    type_into(page, r["x"], r["y"], password, "password field")
+    r = ask(page, "Where is the Log in button?")
+    if not r["found"]:
+        return False
+    click_at(page, r["x"], r["y"], "Log in button")
+    time.sleep(5)
+    return is_logged_in(page, "Instagram")
+
+
+LOGIN_FNS = {
+    "tiktok": login_tiktok,
+    "youtube": login_google,
+    "facebook": login_facebook,
+    "instagram": login_instagram,
+}
+
+
+def ensure_logged_in(page: Page, platform: str, creds: dict) -> bool:
+    if is_logged_in(page, platform):
+        log.info(f"[{platform}] Already logged in.")
+        return True
+    email = creds.get("email", "")
+    password = creds.get("password", "")
+    if not email or not password:
+        log.warning(f"[{platform}] Not logged in and no credentials provided.")
+        return False
+    return LOGIN_FNS[platform](page, email, password)
+
+
+# ---------------------------------------------------------------------------
+# Platform posters
+# ---------------------------------------------------------------------------
+
+def post_tiktok(context: BrowserContext, slot: str, video_path: str, caption: str, creds: dict) -> str:
     page = context.new_page()
     try:
-        log.info(f"[{slot}/tiktok] Navigating to upload page...")
-        page.goto("https://www.tiktok.com/upload", wait_until="domcontentloaded")
-        time.sleep(4)
+        page.goto("https://www.tiktok.com", wait_until="domcontentloaded")
+        time.sleep(3)
+        if not ensure_logged_in(page, "tiktok", creds):
+            raise RuntimeError("Could not log in to TikTok.")
 
-        # Set file — TikTok wraps the input inside an iframe
+        log.info(f"[{slot}/tiktok] Navigating to upload...")
+        page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded")
+        time.sleep(5)
+
+        # Set file — TikTok wraps input in an iframe
         uploaded = False
-        for frame in page.frames:
+        for frame in [page] + page.frames:
             try:
                 fi = frame.locator('input[type="file"]')
                 if fi.count() > 0:
                     fi.first.set_input_files(video_path)
                     uploaded = True
-                    log.info(f"[{slot}/tiktok] File set via iframe.")
+                    log.info(f"[{slot}/tiktok] File set.")
                     break
             except Exception:
                 continue
         if not uploaded:
-            page.locator('input[type="file"]').first.set_input_files(video_path)
-            log.info(f"[{slot}/tiktok] File set via main page.")
+            raise RuntimeError("Could not find TikTok file input.")
 
-        # Wait for TikTok to process the video
-        time.sleep(15)
+        time.sleep(10)
         wait_for_upload(page, "TikTok", timeout=120)
         time.sleep(3)
 
-        # Find caption input
-        r = ask(page, "Where is the text input box for the video caption or description?", "TikTok upload page, video is processed.")
-        if not r["found"]:
-            raise RuntimeError("Could not find TikTok caption input")
-        click_at(page, r["x"], r["y"], "caption box")
-        page.keyboard.press("Control+a")
-        time.sleep(0.3)
-        page.keyboard.type(caption[:150], delay=70)
-        time.sleep(2)
+        r = ask(page, "Where is the caption or description text input box for the video?", "TikTok upload page.")
+        if r["found"]:
+            type_into(page, r["x"], r["y"], caption[:150], "caption")
+            time.sleep(2)
 
-        # Find Post button
         r = ask(page, "Where is the Post or Publish button to submit the video?")
         if not r["found"]:
-            raise RuntimeError("Could not find TikTok Post button")
+            raise RuntimeError("Could not find TikTok Post button.")
         click_at(page, r["x"], r["y"], "Post button")
         time.sleep(15)
 
-        # Verify
-        r = ask(page, "Has the video been posted successfully? Look for a success message, redirect to your profile, or confirmation screen.")
+        r = ask(page, "Was the video posted successfully? Look for a success message or redirect away from upload page.")
         log.info(f"[{slot}/tiktok] Result: {r['answer']}")
         return "https://www.tiktok.com"
     finally:
         page.close()
 
 
-# ---------------------------------------------------------------------------
-# YouTube
-# ---------------------------------------------------------------------------
-
-def post_youtube(context: BrowserContext, slot: str, video_path: str, caption: str) -> str:
+def post_youtube(context: BrowserContext, slot: str, video_path: str, caption: str, creds: dict) -> str:
     page = context.new_page()
     try:
-        log.info(f"[{slot}/youtube] Navigating to YouTube Studio...")
         page.goto("https://studio.youtube.com", wait_until="domcontentloaded")
         time.sleep(4)
+        if not ensure_logged_in(page, "youtube", creds):
+            raise RuntimeError("Could not log in to YouTube.")
 
-        # Click CREATE button
-        r = ask(page, "Where is the CREATE button or upload button in the top area of YouTube Studio?")
+        r = ask(page, "Where is the CREATE or Upload button in YouTube Studio?")
         if not r["found"]:
-            raise RuntimeError("Could not find YouTube CREATE button")
-        click_at(page, r["x"], r["y"], "CREATE button")
+            raise RuntimeError("Could not find YouTube CREATE button.")
+        click_at(page, r["x"], r["y"], "CREATE")
         time.sleep(2)
 
-        # Click Upload videos
-        r = ask(page, "Where is the 'Upload videos' option in the dropdown menu?")
-        if not r["found"]:
-            raise RuntimeError("Could not find Upload videos option")
-        click_at(page, r["x"], r["y"], "Upload videos")
-        time.sleep(2)
+        r = ask(page, "Where is the 'Upload videos' option in the menu?")
+        if r["found"]:
+            click_at(page, r["x"], r["y"], "Upload videos")
+            time.sleep(2)
 
-        # Set file
         page.locator('input[type="file"]').first.set_input_files(video_path)
-        log.info(f"[{slot}/youtube] File set. Waiting for upload...")
+        log.info(f"[{slot}/youtube] File set. Waiting...")
         time.sleep(10)
         wait_for_upload(page, "YouTube", timeout=180)
         time.sleep(3)
 
-        # Fill title
         r = ask(page, "Where is the title input field for the video?", "YouTube upload dialog is open.")
         if r["found"]:
-            click_at(page, r["x"], r["y"], "title field")
-            page.keyboard.press("Control+a")
-            page.keyboard.type(caption[:90], delay=60)
+            type_into(page, r["x"], r["y"], caption[:90], "title")
             time.sleep(1)
 
-        # Click Next x3
         for i in range(3):
-            r = ask(page, "Where is the Next button to proceed to the next step?")
+            r = ask(page, "Where is the Next button to proceed?")
             if r["found"]:
                 click_at(page, r["x"], r["y"], f"Next ({i+1})")
                 time.sleep(2)
 
-        # Set Public
-        r = ask(page, "Where is the Public visibility option or radio button?")
+        r = ask(page, "Where is the Public visibility option?")
         if r["found"]:
             click_at(page, r["x"], r["y"], "Public")
             time.sleep(1)
 
-        # Publish
-        r = ask(page, "Where is the Publish or Save button to publish the video?")
+        r = ask(page, "Where is the Publish or Save button?")
         if not r["found"]:
-            raise RuntimeError("Could not find YouTube Publish button")
+            raise RuntimeError("Could not find YouTube Publish button.")
         click_at(page, r["x"], r["y"], "Publish")
         time.sleep(15)
 
-        r = ask(page, "Has the video been published successfully? Look for a confirmation or success message.")
+        r = ask(page, "Was the video published successfully?")
         log.info(f"[{slot}/youtube] Result: {r['answer']}")
         return "https://studio.youtube.com"
     finally:
         page.close()
 
 
-# ---------------------------------------------------------------------------
-# Facebook
-# ---------------------------------------------------------------------------
-
-def post_facebook(context: BrowserContext, slot: str, video_path: str, caption: str) -> str:
+def post_facebook(context: BrowserContext, slot: str, video_path: str, caption: str, creds: dict) -> str:
     page = context.new_page()
     try:
-        log.info(f"[{slot}/facebook] Navigating to Facebook Reels creator...")
+        page.goto("https://www.facebook.com", wait_until="domcontentloaded")
+        time.sleep(4)
+        if not ensure_logged_in(page, "facebook", creds):
+            raise RuntimeError("Could not log in to Facebook.")
+
         page.goto("https://www.facebook.com/reels/create", wait_until="domcontentloaded")
         time.sleep(5)
 
-        # If redirected away, try the video composer via home page
         if "reels/create" not in page.url:
-            page.goto("https://www.facebook.com", wait_until="domcontentloaded")
-            time.sleep(3)
-            r = ask(page, "Where is the Photo/video or Reel option to create a new video post?")
+            r = ask(page, "Where is the option to create a Reel or upload a video?")
             if r["found"]:
-                click_at(page, r["x"], r["y"], "video post option")
-                time.sleep(2)
+                click_at(page, r["x"], r["y"], "create reel")
+                time.sleep(3)
+
+        try:
+            fi = page.locator('input[type="file"]').first
+            fi.set_input_files(video_path)
+        except Exception:
+            page.evaluate('document.querySelectorAll(\'input[type="file"]\').forEach(e=>{ e.style.display="block"; e.style.opacity="1"; })')
+            page.locator('input[type="file"]').first.set_input_files(video_path)
+
+        log.info(f"[{slot}/facebook] File set. Waiting...")
+        time.sleep(15)
+        wait_for_upload(page, "Facebook", timeout=120)
+        time.sleep(3)
+
+        r = ask(page, "Where is the caption or description text input for the video?", "Facebook video upload.")
+        if r["found"]:
+            type_into(page, r["x"], r["y"], caption[:200], "caption")
+            time.sleep(2)
+
+        r = ask(page, "Where is the Share or Publish button to post this video?")
+        if not r["found"]:
+            raise RuntimeError("Could not find Facebook Share button.")
+        click_at(page, r["x"], r["y"], "Share")
+        time.sleep(15)
+
+        r = ask(page, "Was the video posted successfully?")
+        log.info(f"[{slot}/facebook] Result: {r['answer']}")
+        return "https://www.facebook.com"
+    finally:
+        page.close()
+
+
+def post_instagram(context: BrowserContext, slot: str, video_path: str, caption: str, creds: dict) -> str:
+    page = context.new_page()
+    try:
+        page.goto("https://www.instagram.com", wait_until="domcontentloaded")
+        time.sleep(4)
+        if not ensure_logged_in(page, "instagram", creds):
+            raise RuntimeError("Could not log in to Instagram.")
+
+        r = ask(page, "Where is the Create or + button to make a new post or reel?", "Instagram home feed.")
+        if not r["found"]:
+            raise RuntimeError("Could not find Instagram Create button.")
+        click_at(page, r["x"], r["y"], "Create button")
+        time.sleep(2)
+
+        r = ask(page, "Where is the 'Post' or 'Reel' option in the menu?")
+        if r["found"]:
+            click_at(page, r["x"], r["y"], "Reel option")
+            time.sleep(2)
 
         # Set file
         try:
             fi = page.locator('input[type="file"]').first
             fi.set_input_files(video_path)
         except Exception:
-            page.evaluate('document.querySelector(\'input[type="file"]\').style.display="block"')
+            page.evaluate('document.querySelectorAll(\'input[type="file"]\').forEach(e=>{ e.style.display="block"; e.style.opacity="1"; })')
             page.locator('input[type="file"]').first.set_input_files(video_path)
 
-        log.info(f"[{slot}/facebook] File set. Waiting for upload...")
-        time.sleep(15)
-        wait_for_upload(page, "Facebook", timeout=120)
+        log.info(f"[{slot}/instagram] File set. Waiting...")
+        time.sleep(10)
+        wait_for_upload(page, "Instagram", timeout=120)
         time.sleep(3)
 
-        # Find caption area
-        r = ask(page, "Where is the caption or description text input for the video?", "Facebook video upload page.")
+        # Next through Instagram's multi-step flow
+        for i in range(3):
+            r = ask(page, "Where is the Next button to proceed to the next step?")
+            if r["found"]:
+                click_at(page, r["x"], r["y"], f"Next ({i+1})")
+                time.sleep(2)
+            else:
+                break
+
+        r = ask(page, "Where is the caption or write a caption text input area?", "Instagram final step before sharing.")
         if r["found"]:
-            click_at(page, r["x"], r["y"], "caption")
-            page.keyboard.type(caption[:200], delay=70)
+            type_into(page, r["x"], r["y"], caption[:2200], "caption")
             time.sleep(2)
 
-        # Post / Share
-        r = ask(page, "Where is the Share or Publish button to post this video?")
+        r = ask(page, "Where is the Share or Post button to publish this reel?")
         if not r["found"]:
-            raise RuntimeError("Could not find Facebook Share button")
-        click_at(page, r["x"], r["y"], "Share button")
+            raise RuntimeError("Could not find Instagram Share button.")
+        click_at(page, r["x"], r["y"], "Share")
         time.sleep(15)
 
-        r = ask(page, "Was the video posted successfully? Look for a confirmation, redirect, or success state.")
-        log.info(f"[{slot}/facebook] Result: {r['answer']}")
-        return "https://www.facebook.com"
+        r = ask(page, "Was the reel posted successfully? Look for a success message or redirect to feed.")
+        log.info(f"[{slot}/instagram] Result: {r['answer']}")
+        return "https://www.instagram.com"
     finally:
         page.close()
 
@@ -291,6 +460,7 @@ PLATFORM_FNS = {
     "tiktok": post_tiktok,
     "youtube": post_youtube,
     "facebook": post_facebook,
+    "instagram": post_instagram,
 }
 
 
@@ -304,7 +474,7 @@ def load_session(context: BrowserContext, slot: str, platform: str) -> None:
         context.add_cookies(json.loads(data))
         log.info(f"[{slot}/{platform}] Session loaded.")
     except Exception:
-        log.warning(f"[{slot}/{platform}] No saved session found.")
+        pass
 
 
 def save_session(context: BrowserContext, slot: str, platform: str) -> None:
@@ -314,17 +484,20 @@ def save_session(context: BrowserContext, slot: str, platform: str) -> None:
             file=json.dumps(context.cookies()).encode(),
             file_options={"content-type": "application/json", "upsert": "true"},
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"[{slot}/{platform}] Could not save session: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Supabase job helpers
+# Supabase helpers
 # ---------------------------------------------------------------------------
 
 def get_creds(slot: str, platform: str) -> dict:
-    p = f"POSTER_{slot.upper()}_{platform.upper()}"
-    return {"email": os.environ.get(f"{p}_EMAIL", ""), "password": os.environ.get(f"{p}_PASSWORD", "")}
+    prefix = f"POSTER_{slot.upper()}_{platform.upper()}"
+    return {
+        "email": os.environ.get(f"{prefix}_EMAIL", ""),
+        "password": os.environ.get(f"{prefix}_PASSWORD", ""),
+    }
 
 
 def get_or_create_post_record(clip_id: str, slot: str, platform: str) -> str:
@@ -345,14 +518,30 @@ def mark_post(post_id: str, status: str, post_url: str = None, error: str = None
     }).eq("id", post_id).execute()
 
 
+def mark_post_with_retry(post_id: str, status: str, post_url: str = None) -> None:
+    for attempt in range(5):
+        try:
+            mark_post(post_id, status, post_url=post_url)
+            return
+        except Exception as e:
+            if attempt < 4:
+                time.sleep(2 ** attempt)
+            else:
+                log.error(f"mark_post failed after 5 attempts: {e}")
+
+
 def download_clip(storage_path: str, local_path: str) -> None:
-    with open(local_path, "wb") as f:
-        f.write(supabase.storage.from_(CLIP_BUCKET).download(storage_path))
-
-
-def all_done(clip_id: str, slot: str) -> bool:
-    r = supabase.table("posts").select("status").eq("clip_id", clip_id).eq("poster_slot", slot).execute()
-    return len([x for x in r.data if x["status"] == "posted"]) >= len(PLATFORMS)
+    for attempt in range(4):
+        try:
+            data = supabase.storage.from_(CLIP_BUCKET).download(storage_path)
+            with open(local_path, "wb") as f:
+                f.write(data)
+            return
+        except Exception as e:
+            if attempt == 3:
+                raise
+            log.warning(f"Download attempt {attempt+1} failed: {e}")
+            time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +551,14 @@ def all_done(clip_id: str, slot: str) -> bool:
 def process_job(job: dict, slot: str, context: BrowserContext) -> None:
     job_id = job["id"]
     payload = json.loads(job["payload"])
-    clip_id, storage_path, caption = payload["clip_id"], payload["storage_path"], payload.get("caption", "")
+    clip_id = payload["clip_id"]
+    storage_path = payload["storage_path"]
+    caption = payload.get("caption", "")
 
-    log.info(f"[{slot}] Job {job_id}")
-    supabase.table("jobs").update({"status": "running", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", job_id).execute()
+    log.info(f"[{slot}] Processing job {job_id}")
+    supabase.table("jobs").update({
+        "status": "running", "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", job_id).execute()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         video_path = os.path.join(tmpdir, "clip.mp4")
@@ -380,50 +573,63 @@ def process_job(job: dict, slot: str, context: BrowserContext) -> None:
                 continue
 
             post_id = get_or_create_post_record(clip_id, slot, platform)
+            already = supabase.table("posts").select("status").eq("id", post_id).single().execute()
+            if already.data and already.data["status"] == "posted":
+                log.info(f"[{slot}/{platform}] Already posted, skipping.")
+                continue
+
             try:
-                url = PLATFORM_FNS[platform](context, slot, video_path, caption)
-                mark_post(post_id, "posted", post_url=url)
+                url = PLATFORM_FNS[platform](context, slot, video_path, caption, creds)
+                mark_post_with_retry(post_id, "posted", post_url=url)
+                log.info(f"[{slot}/{platform}] Posted ✓")
             except Exception as exc:
-                log.error(f"[{slot}/{platform}] Failed: {exc}")
+                log.error(f"[{slot}/{platform}] Failed: {exc}", exc_info=True)
                 mark_post(post_id, "failed", error=str(exc))
                 all_ok = False
-            time.sleep(random.uniform(4, 8))
+
+            save_session(context, slot, platform)
+            time.sleep(random.uniform(5, 10))
 
     supabase.table("jobs").update({
         "status": "done" if all_ok else "failed",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", job_id).execute()
 
-    if all_done(clip_id, slot):
-        try:
-            supabase.storage.from_(CLIP_BUCKET).remove([storage_path])
-            log.info(f"Clip deleted from storage.")
-        except Exception:
-            pass
-
 
 # ---------------------------------------------------------------------------
-# Main
+# Run one slot
 # ---------------------------------------------------------------------------
 
-def main(slot: str) -> None:
-    log.info(f"Poster {slot.upper()} starting — {datetime.now(timezone.utc).isoformat()}")
-    jobs = supabase.table("jobs").select("*").eq("job_type", f"post_{slot}").eq("status", "pending").order("created_at").execute().data
-    log.info(f"{len(jobs)} pending job(s).")
+def run_slot(slot: str) -> None:
+    log.info(f"=== Slot {slot.upper()} ===")
+    jobs = (
+        supabase.table("jobs").select("*")
+        .eq("job_type", f"post_{slot}").eq("status", "pending")
+        .order("created_at").limit(1).execute().data
+    )
     if not jobs:
+        log.info(f"[{slot}] No pending jobs.")
         return
 
-    headless = os.environ.get("HEADLESS", "false").lower() == "true"
+    launch_kwargs = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage",
+                 "--disable-blink-features=AutomationControlled",
+                 "--disable-gpu", "--disable-software-rasterizer"],
+    }
+    if sys_platform.system() == "Darwin":
+        launch_kwargs["executable_path"] = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        launch_kwargs["headless"] = os.environ.get("HEADLESS", "false").lower() == "true"
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=headless,
-            executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-        )
+        browser = pw.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
         )
 
         for platform in PLATFORMS:
@@ -433,22 +639,39 @@ def main(slot: str) -> None:
             try:
                 process_job(job, slot, context)
             except Exception as exc:
-                log.error(f"Job {job['id']} crashed: {exc}", exc_info=True)
+                log.error(f"[{slot}] Job {job['id']} crashed: {exc}", exc_info=True)
                 supabase.table("jobs").update({
                     "status": "failed", "error": str(exc)[:1000],
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }).eq("id", job["id"]).execute()
 
-        for platform in PLATFORMS:
-            save_session(context, slot, platform)
-
         browser.close()
 
-    log.info(f"Poster {slot.upper()} done.")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    log.info(f"Poster starting — {datetime.now(timezone.utc).isoformat()}")
+
+    if not is_posting_time():
+        log.info("Not a posting time — exiting.")
+        return
+
+    log.info("Posting time confirmed. Running slots A and B.")
+    for slot in ["a", "b"]:
+        try:
+            run_slot(slot)
+        except Exception as exc:
+            log.error(f"Slot {slot} crashed: {exc}", exc_info=True)
+
+    log.info("Poster done.")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in ("a", "b"):
-        print("Usage: python3 poster.py a|b")
-        sys.exit(1)
-    main(sys.argv[1])
+    # Allow `python3 poster.py` (both slots) or `python3 poster.py a` (single slot, skip time check)
+    if len(sys.argv) == 2 and sys.argv[1] in ("a", "b"):
+        run_slot(sys.argv[1])
+    else:
+        main()

@@ -2,22 +2,26 @@
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
-# This file defines one service — duplicate in Railway dashboard for each cron job.
-# Environment variables to set in Railway (never commit .env):
+# ── Service architecture ────────────────────────────────────────────────────
+# Service   Start command          Cron
+# watcher   python3 watcher.py     0 */6 * * *    (every 6h)
+# clipper   python3 clipper.py     */30 * * * *   (every 30m)
+# poster    python3 poster.py      */30 * * * *   (every 30m, posts only at scheduled times)
+#
+# Poster posting times (UTC): 09:00, 16:30, 18:00
+#
+# Env vars to set in Railway (never commit .env):
 #   SUPABASE_URL, SUPABASE_KEY, ANTHROPIC_API_KEY
-#   POSTER_A_FACEBOOK_EMAIL, POSTER_A_FACEBOOK_PASSWORD
-#   POSTER_A_TIKTOK_EMAIL, POSTER_A_TIKTOK_PASSWORD
-#   POSTER_A_YOUTUBE_EMAIL, POSTER_A_YOUTUBE_PASSWORD
+#   POSTER_A_TIKTOK_EMAIL,    POSTER_A_TIKTOK_PASSWORD
+#   POSTER_A_YOUTUBE_EMAIL,   POSTER_A_YOUTUBE_PASSWORD
+#   POSTER_A_FACEBOOK_EMAIL,  POSTER_A_FACEBOOK_PASSWORD
+#   POSTER_A_INSTAGRAM_EMAIL, POSTER_A_INSTAGRAM_PASSWORD
+#   POSTER_B_TIKTOK_EMAIL,    POSTER_B_TIKTOK_PASSWORD
+#   POSTER_B_YOUTUBE_EMAIL,   POSTER_B_YOUTUBE_PASSWORD
+#   POSTER_B_FACEBOOK_EMAIL,  POSTER_B_FACEBOOK_PASSWORD
+#   POSTER_B_INSTAGRAM_EMAIL, POSTER_B_INSTAGRAM_PASSWORD
 #   HEADLESS=true
-#   WHISPER_MODEL=base
-
-# ── Cron schedules ─────────────────────────────────────────────────────────
-# Service         Start command                    Cron
-# watcher-a       python3 watcher.py a             0 */6 * * *   (every 6h)
-# clipper-a       python3 clipper.py a             */30 * * * *  (every 30m) — also handles watch_manual jobs
-# poster-tiktok-a python3 poster_tiktok.py a       0 */4 * * *   (every 4h)
-# poster-yt-a     python3 poster_youtube.py a      0 */4 * * *   (every 4h)
-# poster-fb-a     python3 poster_facebook.py a     0 */4 * * *   (every 4h)
+#   WHISPER_MODEL=tiny
 
 [deploy]
 restartPolicyType = "never"
