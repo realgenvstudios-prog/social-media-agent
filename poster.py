@@ -259,18 +259,22 @@ def post_tiktok(context: BrowserContext, slot: str, video_path: str, caption: st
         page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded")
         time.sleep(5)
 
-        # Set file — TikTok wraps input in an iframe
+        # Set file — TikTok wraps input in an iframe; wait up to 20s for it
         uploaded = False
-        for frame in [page] + page.frames:
-            try:
-                fi = frame.locator('input[type="file"]')
-                if fi.count() > 0:
-                    fi.first.set_input_files(video_path)
-                    uploaded = True
-                    log.info(f"[{slot}/tiktok] File set.")
-                    break
-            except Exception:
-                continue
+        deadline = time.time() + 20
+        while time.time() < deadline and not uploaded:
+            for frame in [page] + list(page.frames):
+                try:
+                    fi = frame.locator('input[type="file"]')
+                    if fi.count() > 0:
+                        fi.first.set_input_files(video_path)
+                        uploaded = True
+                        log.info(f"[{slot}/tiktok] File set.")
+                        break
+                except Exception:
+                    continue
+            if not uploaded:
+                time.sleep(2)
         if not uploaded:
             raise RuntimeError("Could not find TikTok file input.")
 
@@ -315,6 +319,12 @@ def post_youtube(context: BrowserContext, slot: str, video_path: str, caption: s
             click_at(page, r["x"], r["y"], "Upload videos")
             time.sleep(2)
 
+        # Wait for the upload dialog's file input to appear (can take 5-15s)
+        try:
+            page.wait_for_selector('input[type="file"]', state="attached", timeout=30000)
+        except Exception:
+            pass
+        time.sleep(3)
         page.locator('input[type="file"]').first.set_input_files(video_path)
         log.info(f"[{slot}/youtube] File set. Waiting...")
         time.sleep(10)
